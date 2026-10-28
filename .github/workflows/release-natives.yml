@@ -99,6 +99,14 @@ jobs:
           cp -L "$BUILT" "stage/$JNA_PLATFORM/$LIB"
           tar -czf "$ARCHIVE" -C stage "$JNA_PLATFORM"
 
+      # The load check lives here, not on JitPack: its build image is older than the
+      # Linux desktops the app supports, so a load failure there proves nothing.
+      - name: Load the packaged library
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
+          "$PY" -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1]).Cap_getLibraryVersion' "stage/$JNA_PLATFORM/$LIB"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openpnp-capture-${{ matrix.target }}
