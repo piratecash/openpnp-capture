@@ -343,6 +343,7 @@ void captureThreadFunctionAsync(PlatformStream *stream, int fd, size_t bufferSiz
 
 PlatformStream::PlatformStream() : 
     Stream(),
+    m_deviceHandle(-1),
     m_quitThread(false),
     m_helperThread(nullptr)
 {
@@ -374,7 +375,10 @@ void PlatformStream::close()
     }
 
     m_frameBuffer.resize(0);
-    ::close(m_deviceHandle);
+    if (m_deviceHandle >= 0)
+    {
+        ::close(m_deviceHandle);
+    }
 
     m_deviceHandle = -1;    
 }

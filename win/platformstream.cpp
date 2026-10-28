@@ -114,7 +114,10 @@ PlatformStream::PlatformStream() :
     m_sourceFilter(nullptr),
     m_nullRenderer(nullptr),
     m_sampleGrabber(nullptr),
-    m_camControl(nullptr)
+    m_camControl(nullptr),
+    m_capture(nullptr),
+    m_videoProcAmp(nullptr),
+    dwRotRegister(0)
 {
 
 }

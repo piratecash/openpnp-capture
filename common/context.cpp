@@ -162,6 +162,7 @@ int32_t Context::openStream(CapDeviceID id, CapFormatID formatID)
                  device->m_formats[formatID].fps))
     {
         LOG(LOG_ERR, "Could not open stream for device %s\n", device->m_name.c_str());
+        delete s;
         return -1;
     }
     else
