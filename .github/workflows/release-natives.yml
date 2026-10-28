@@ -1,0 +1,195 @@
+name: Release natives
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two runs on one tag would otherwise overwrite each other's uploads through --clobber.
+concurrency:
+  group: release-natives-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+            jna: darwin-aarch64
+            lib: libopenpnp-capture.dylib
+            built: build/libopenpnp-capture.dylib
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+              -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          - target: linux-x64
+            runner: ubuntu-22.04
+            jna: linux-x86-64
+            lib: libopenpnp-capture.so
+            built: build/libopenpnp-capture.so
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          # The Visual Studio generator finds MSVC on its own, so no developer shell is needed.
+          - target: windows-x64
+            runner: windows-2025
+            jna: win32-x86-64
+            lib: openpnp-capture.dll
+            built: build/Release/openpnp-capture.dll
+            cmake_args: -A x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARCHIVE: openpnp-capture-${{ matrix.target }}.tar.gz
+      JNA_PLATFORM: ${{ matrix.jna }}
+      LIB: ${{ matrix.lib }}
+      BUILT: ${{ matrix.built }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # CMake stamps the library version from `git describe --tags`.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -y && sudo apt-get install -y nasm libgtk-3-dev
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # A runner CPU's feature set must not leak into a binary that ships to other machines.
+      - name: Refuse host-specific CPU flags
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          test -s build/compile_commands.json
+          if grep -- '-march=' build/compile_commands.json; then
+            echo "compile commands contain -march=" >&2
+            exit 1
+          fi
+
+      # A system libturbojpeg found by pkg-config would become a runtime dependency users lack.
+      - name: Refuse a dynamic libturbojpeg
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if readelf -d "$BUILT" | grep -i turbojpeg; then
+            echo "$BUILT links libturbojpeg dynamically" >&2
+            exit 1
+          fi
+
+      - name: Package
+        env:
+          # Keeps macOS tar from adding AppleDouble ._ entries.
+          COPYFILE_DISABLE: 1
+        run: |
+          set -euo pipefail
+          mkdir -p "stage/$JNA_PLATFORM"
+          # -L: the built name is a symlink chain to the versioned library.
+          cp -L "$BUILT" "stage/$JNA_PLATFORM/$LIB"
+          tar -czf "$ARCHIVE" -C stage "$JNA_PLATFORM"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openpnp-capture-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      # permissions alone does not hand gh a session; it reads GH_TOKEN.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: openpnp-capture-*
+          path: release
+          merge-multiple: true
+
+      - name: Refuse to publish an incomplete or wrong set
+        working-directory: release
+        run: |
+          set -euo pipefail
+          expected='openpnp-capture-linux-x64.tar.gz openpnp-capture-macos-arm64.tar.gz openpnp-capture-windows-x64.tar.gz'
+          [ "$(ls | sort | xargs)" = "$expected" ] || { echo "unexpected archive set: $(ls | xargs)" >&2; exit 1; }
+
+          # Each archive is unpacked on its own, so a misplaced file cannot be covered by another archive.
+          check() {
+            local archive="$1" entry="$2"; shift 2
+            local root="$RUNNER_TEMP/unpack/$archive"
+            mkdir -p "$root"
+            tar -xzf "$archive" -C "$root"
+            [ "$(cd "$root" && find . ! -type d)" = "./$entry" ] || { echo "$archive must hold exactly $entry" >&2; exit 1; }
+            [ -s "$root/$entry" ] || { echo "$entry in $archive is empty" >&2; exit 1; }
+            local described
+            described="$(file -b "$root/$entry")"
+            for want in "$@"; do
+              case "$described" in
+                *"$want"*) ;;
+                *) echo "$entry is '$described', which is not $want" >&2; exit 1 ;;
+              esac
+            done
+          }
+          check openpnp-capture-macos-arm64.tar.gz darwin-aarch64/libopenpnp-capture.dylib 'Mach-O' 'arm64'
+          check openpnp-capture-linux-x64.tar.gz linux-x86-64/libopenpnp-capture.so 'ELF 64-bit' 'x86-64'
+          check openpnp-capture-windows-x64.tar.gz win32-x86-64/openpnp-capture.dll 'PE32+' 'x86-64'
+
+      - name: Write the release manifest
+        working-directory: release
+        run: |
+          set -euo pipefail
+          sha256sum openpnp-capture-*.tar.gz > natives.sha256
+          cat natives.sha256
+
+      - name: Publish the natives to the tag
+        working-directory: release
+        run: |
+          set -euo pipefail
+          assets=(openpnp-capture-*.tar.gz natives.sha256)
+
+          local_digests() {
+            for asset in "${assets[@]}"; do
+              printf '%s sha256:%s\n' "$asset" "$(sha256sum "$asset" | cut -d' ' -f1)"
+            done | sort
+          }
+          remote_digests() {
+            gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.digest)"' | sort
+          }
+
+          state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)"
+
+          if [ "$state" = 'false' ]; then
+            # Already public: a consumer may have resolved these bytes, so they are final.
+            if diff -u <(local_digests) <(remote_digests); then
+              echo "$TAG already carries exactly this set"
+              exit 0
+            fi
+            echo "$TAG is already published with a different set of natives; cut the next tag" >&2
+            exit 1
+          fi
+
+          # A draft first: JitPack must not see the assets while they are still uploading.
+          if [ "$state" = 'absent' ]; then
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Prebuilt natives for openpnp-capture-java.'
+          fi
+          # --clobber so a rerun after a failed upload finishes the job instead of refusing.
+          gh release upload "$TAG" --clobber "${assets[@]}"
+          diff -u <(local_digests) <(remote_digests)
+          gh release edit "$TAG" --draft=false
